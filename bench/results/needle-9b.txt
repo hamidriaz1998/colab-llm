@@ -1,0 +1,7 @@
+  tokens  depth  result  prefill tok/s  gen tok/s  wall s
+   32031   0.10    PASS            637       25.2      52
+   32032   0.50    PASS            806       22.0      42
+   32031   0.90    PASS            818       23.2      42
+  128007   0.50    PASS            555       17.9     234
+  199959   0.25    PASS            446       15.4     454
+  199959   0.75    PASS            447       15.7     456
