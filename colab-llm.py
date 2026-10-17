@@ -7,6 +7,7 @@
     ./colab-llm.py --watch         # keep the VM alive and repair the tunnel/server/session when they die
     ./colab-llm.py --model 14b     # swap the served model (both stay cached on the VM)
     ./colab-llm.py --ctx 32768     # override the per-model context default
+    ./colab-llm.py --think         # let the model reason before it answers (slower, default off)
     ./colab-llm.py --tunnel cloudflare   # public https URL instead of the local ssh tunnel
     ./colab-llm.py --no-register   # skip writing the omp/fx provider
 
@@ -165,6 +166,10 @@ def _llm_main():
             "--jinja", "--flash-attn", "on", "--cache-type-k", KV, "--cache-type-v", KV]
     if PREFIX:
         args += ["--api-prefix", PREFIX]
+    if E.get("LLM_THINK") != "1":
+        # Qwen3/3.5 think before each answer by default: ~5x slower replies in agent loops.
+        # A request can still turn it on with chat_template_kwargs.
+        args += ["--chat-template-kwargs", '{"enable_thinking":false}']
     running = sh("pgrep -a -f '^/content/llama/.*/llama-server'").splitlines()
     if not (len(running) == 1 and running[0].split(" ", 1)[1] == " ".join(args) and get(BASE + "/health")):
         if running:
@@ -277,7 +282,7 @@ def remote_bootstrap(a: argparse.Namespace, prefix: str, force_tunnel: bool = Fa
         "LLM_BUILD": BUILD, "LLM_ALIAS": MODEL_ALIAS, "LLM_KV": KV_TYPE, "LLM_MODEL_URL": m["url"],
         "LLM_MIN_GIB": str(m["gib"]), "LLM_CTX": str(a.ctx), "LLM_TUNNEL": a.tunnel,
         "LLM_PREFIX": prefix, "LLM_PORT": str(REMOTE_PORT), "LLM_CLOUDFLARED": CLOUDFLARED,
-        "LLM_FORCE_TUNNEL": "1" if force_tunnel else "0",
+        "LLM_FORCE_TUNNEL": "1" if force_tunnel else "0", "LLM_THINK": "1" if a.think else "0",
     }
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
         fh.write(REMOTE)
@@ -383,7 +388,7 @@ def write_config(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def register_omp(url: str, ctx: int) -> None:
+def register_omp(url: str, ctx: int, think: bool) -> None:
     if yaml is None:
         log("PyYAML is not installed; skipping omp registration (pip install pyyaml)")
         return
@@ -397,7 +402,7 @@ def register_omp(url: str, ctx: int) -> None:
         "models": [{
             "id": MODEL_ALIAS,
             "name": "Colab uncensored (abliterated)",
-            "reasoning": False,
+            "reasoning": think,
             "input": ["text"],
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
             "contextWindow": ctx,
@@ -456,7 +461,8 @@ def serve(a: argparse.Namespace, force_tunnel: bool = False) -> tuple[str, dict]
     if a.tunnel == "ssh":
         base = f"http://127.0.0.1:{a.port}"
         # Fast path: the tunnel and server already match, so no Colab call at all.
-        if not force_tunnel and st.get("base") == base and tunnel_up(a.session) and matches(props(base), a):
+        if (not force_tunnel and st.get("base") == base and st.get("think") == a.think
+                and tunnel_up(a.session) and matches(props(base), a)):
             return base, {}
         ensure_session(a.session, a.gpu)
         info = remote_bootstrap(a, prefix="")
@@ -465,7 +471,8 @@ def serve(a: argparse.Namespace, force_tunnel: bool = False) -> tuple[str, dict]
             start_tunnel(a.session, a.port)
     else:
         prefix = st.get("prefix") or "/" + secrets.token_urlsafe(16)
-        if not force_tunnel and st.get("tunnel") == "cloudflare" and matches(props(st.get("base", "")), a):
+        if (not force_tunnel and st.get("tunnel") == "cloudflare" and st.get("think") == a.think
+                and matches(props(st.get("base", "")), a)):
             return st["base"], {}
         ensure_session(a.session, a.gpu)
         info = remote_bootstrap(a, prefix=prefix, force_tunnel=force_tunnel)
@@ -473,9 +480,9 @@ def serve(a: argparse.Namespace, force_tunnel: bool = False) -> tuple[str, dict]
         st["prefix"] = prefix
     if not props(base, timeout=30):
         raise RuntimeError(f"the server is up on the VM, but {base} does not answer")
-    save_state(a.session, {**st, "tunnel": a.tunnel, "base": base})
+    save_state(a.session, {**st, "tunnel": a.tunnel, "base": base, "think": a.think})
     if a.register:
-        register_omp(f"{base}/v1", info.get("n_ctx") or a.ctx)
+        register_omp(f"{base}/v1", info.get("n_ctx") or a.ctx, a.think)
         register_fx(f"{base}/v1", info.get("n_ctx") or a.ctx)
     return base, info
 
@@ -600,6 +607,9 @@ def main() -> int:
                    help="keep the VM alive with a kernel heartbeat and auto-recover when it dies")
     p.add_argument("--stop-on-exit", action="store_true", help="with --watch: stop the VM on Ctrl-C")
     p.add_argument("--interval", type=int, default=300, help="heartbeat interval in seconds (default 300)")
+    p.add_argument("--think", action=argparse.BooleanOptionalAction, default=False,
+                   help="let the model think before it answers: better on hard problems, ~5x slower "
+                        "(default off)")
     p.add_argument("--register", action=argparse.BooleanOptionalAction, default=True,
                    help="write the omp/fx provider (default on)")
     a = p.parse_args()

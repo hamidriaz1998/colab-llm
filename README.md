@@ -56,6 +56,7 @@ second with an empty context, and about 19 tokens per second at 98K tokens of co
 | `./colab-llm.py --stop` | Closes the tunnel and stops the VM. |
 | `./colab-llm.py --model 14b` | Serves the 14B model. Both models stay cached on the VM. |
 | `./colab-llm.py --ctx 131072` | Overrides the context size of the model. |
+| `./colab-llm.py --think` | Lets the model think before it answers. See [Thinking](#thinking). |
 | `./colab-llm.py --tunnel cloudflare` | Uses a public HTTPS URL instead of the SSH tunnel. |
 | `./colab-llm.py --port 9000` | Uses a different local port for the SSH tunnel. |
 | `./colab-llm.py --no-register` | Does not write the omp and fx configs. |
@@ -71,6 +72,20 @@ To use more than one VM, give each one a name with `--session NAME`.
 
 Use `9b` for agents and coding. It is faster at every context size, and it is the only
 model that can hold more than 40K tokens. See [Benchmarks](#benchmarks).
+
+## Thinking
+
+Both models can think (reason step by step) before they answer. Thinking is off by
+default, because it makes replies much slower on a T4:
+
+| Task | Thinking off | Thinking on |
+|---|---|---|
+| "What is 17*23?" | 4 tokens | 1481 tokens |
+| "Write a palindrome function" | 6.6 s (149 tokens) | 32 s (766 tokens) |
+
+To turn it on for all requests, run `./colab-llm.py --think`. The server restarts, and
+the omp config marks the model as a reasoning model. A client can also turn thinking on
+for one request: send `"chat_template_kwargs": {"enable_thinking": true}`.
 
 ## How it works
 
