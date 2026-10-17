@@ -104,6 +104,7 @@ process runs in the background after the script exits, so the endpoint stays ava
 | Agent configs | Written once. | Written again after each new tunnel. |
 | Time to first token | 571 ms | 976 ms |
 | Reconnect after a failure | 3.6 s | About 15 s, or about 100 s if your DNS resolver caches the failed lookup. |
+| Request time limit | None | About 100 s without response bytes. See [Tunnel performance](#tunnel-performance). |
 | Needs a process on your computer | Yes | No |
 
 Use `--tunnel cloudflare` when another computer must reach the model.
@@ -125,7 +126,8 @@ that meets all three conditions:
 3. It is not larger than the trained context. Past that size, quality drops.
 
 **9b: 262144.** It fits with 1.6 GiB free. At 200K (75% fill), generation is 15.5 tokens
-per second, which is 61% of the empty-context speed. The Qwen3.5 hybrid attention keeps
+per second, which is 61% of the empty-context speed. This value comes from the needle
+test, which generates only about 7 tokens per answer, so treat it as an estimate. The Qwen3.5 hybrid attention keeps
 the KV cache small, so speed drops slowly as the context fills.
 
 **14b: 32768.** At 40960, only 0.5 GiB stays free. At 24K (75% of 32768), generation is
@@ -144,9 +146,10 @@ MiB used after the model loads, out of 15360 MiB:
 
 ### Speed against context depth
 
-Tokens per second, from `llama-bench` (512-token prompt, 128 generated tokens). The f16
-and q8_0 columns come from interleaved runs in ABBA order. That order cancels the effect
-of the T4 heating up and slowing down during a run.
+Tokens per second, from `llama-bench` (512-token prompt, 128 generated tokens). Most rows
+come from interleaved runs in ABBA order (f16, q8_0, q8_0, f16). That order cancels the
+effect of the T4 heating up and slowing down during a run. Rows marked with * come from
+a run without interleaving, so compare them only with each other.
 
 **9b**
 
@@ -155,8 +158,8 @@ of the T4 heating up and slowing down during a run.
 | 0 | 25.3 | 24.9 | 947 | 947 |
 | 32768 | 21.9 | 19.3 | 689 | 679 |
 | 98304 | 19.3 | 12.8 | 419 | 433 |
-| 131072 | | 10.9 | | 368 |
-| 196608 | | 8.2 | | 201 |
+| 131072 * | | 10.9 | | 368 |
+| 196608 * | | 8.2 | | 201 |
 
 **14b**
 
@@ -164,7 +167,7 @@ of the T4 heating up and slowing down during a run.
 |---|---|---|---|---|
 | 0 | 14.6 | 14.7 | 605 | 595 |
 | 16384 | 12.5 | 9.8 | 299 | 310 |
-| 24576 | 11.5 | 8.2 | 250 | 245 |
+| 24576 * | 11.5 | 8.2 | 250 | 245 |
 
 Results:
 
@@ -173,6 +176,9 @@ Results:
   saves VRAM, and both defaults fit in f16.
 - **Keep flash attention on.** At 16K on 9b, flash attention off cuts prompt speed from
   795 to 516 tokens per second, and generation from 22.5 to 16.4.
+- **The context is shared.** llama-server runs 4 request slots that share one 262144-token
+  cache. One request can use all of it. If an agent sends several large requests at
+  the same time, for example from subagents, they can run out of space together.
 - **A long prompt is slow on a T4.** A full 200K-token prompt takes about 7.5 minutes to
   process. llama-server caches the prompt, so in a normal agent session only the new
   tokens need processing. But when an agent changes the start of its prompt, for
@@ -211,7 +217,17 @@ Median and 95th percentile in ms:
 | Time to first token, real llama-server | 976 | 571 |
 | Streamed tokens per second | 13.5 | 13.5 |
 
-Both tunnels stream tokens at the speed of the server. A model at 25 tokens per second
+Both tunnels stream tokens at the speed of the server.
+
+Cloudflare closes a request with HTTP 524 when the server sends nothing for about
+100 seconds. With this model, that happens to a request that does not stream and has a
+prompt larger than about 64K tokens: a 128K prompt failed after 126 seconds. A streamed
+128K request worked, because the server sends its headers early. Most agents stream,
+but the SSH tunnel has no such limit.
+
+An early test with a synthetic server showed Cloudflare holding back a whole stream
+(`bench/results/tunnel-synthetic-cpu.txt`, "stream first chunk"). That result came from
+the test server. Real llama-server output streams through Cloudflare without delay. A model at 25 tokens per second
 sends only a few KB per second, and that is far below what either tunnel can carry. The
 SSH tunnel wins on latency, stability, and privacy.
 
@@ -224,7 +240,7 @@ bench/stream_bench.py cloudflare=https://NAME.trycloudflare.com/v1 ssh=http://12
 
 # Speed and VRAM fit: run on the VM after the models download.
 scp -o ControlPath=$XDG_RUNTIME_DIR/colab-llm-llm.sock bench/gpu_bench.sh bench/kv_ab.sh x:/content/
-ssh -S $XDG_RUNTIME_DIR/colab-llm-llm.sock x 'setsid nohup bash /content/gpu_bench.sh > /content/bench/run.log 2>&1 &'
+ssh -S $XDG_RUNTIME_DIR/colab-llm-llm.sock x 'mkdir -p /content/bench && setsid nohup bash /content/gpu_bench.sh > /content/bench/run.log 2>&1 &'
 
 # Long-context retrieval, through the running endpoint.
 bench/needle.py http://127.0.0.1:8765 --tokens 32000,128000 --depths 0.1,0.5,0.9
