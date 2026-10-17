@@ -53,22 +53,26 @@ PROVIDER_ID = "uncensored"
 MODEL_ALIAS = "abliterated"
 BUILD = "b11696"
 CLOUDFLARED = "2026.10.0"
-KV_TYPE = "q8_0"
+# f16, not q8_0: on a T4 a q8_0 cache generates 33% slower at 98k context (12.8 vs 19.3 tok/s)
+# and saves VRAM that both models do not need at their defaults. See README "Benchmarks".
+KV_TYPE = "f16"
 REMOTE_PORT = 8000  # Colab itself owns 8080
 
-# name -> hf url, approx file GiB, default context. Q4_K_M weights.
+# name -> hf url, approx file GiB, default context. Q4_K_M weights. Each default ctx is the largest
+# that fits a T4 with >= 1 GiB free, keeps generation at 75% fill >= half the empty-context speed,
+# and stays within the trained context (see README "Choosing the context size").
 MODELS = {
     "9b": {
         "url": "https://huggingface.co/mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF/resolve/main/"
                "Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf",
         "gib": 5.24,
-        "ctx": 204800,
+        "ctx": 262144,  # trained context; Qwen3.5 hybrid attention keeps the KV cache small
     },
     "14b": {
         "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-14B-abliterated-v2-GGUF/resolve/main/"
                "Huihui-Qwen3-14B-abliterated-v2.Q4_K_M.gguf",
         "gib": 8.38,
-        "ctx": 32768,
+        "ctx": 32768,  # 40960 (trained) fits only with 0.5 GiB free in f16
     },
 }
 

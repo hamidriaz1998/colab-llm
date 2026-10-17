@@ -36,8 +36,9 @@ def main():
             key = random.randint(100000, 999999)
             reps = int(n / per)
             cut = int(reps * d)
-            text = (FILLER * cut + f"\nThe secret number is {key}. Remember it.\n"
-                    + FILLER * (reps - cut))
+            # A fresh first line defeats the prompt cache, so the timings are a full prefill.
+            text = (f"Document {random.random()}\n" + FILLER * cut
+                    + f"\nThe secret number is {key}. Remember it.\n" + FILLER * (reps - cut))
             t = time.time()
             r = post(a.base, "/v1/chat/completions", {
                 "temperature": 0, "max_tokens": 400,
