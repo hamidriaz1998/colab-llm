@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Start an uncensored llama.cpp model on a free Colab T4 and expose it as an OpenAI endpoint.
 
-    ./colab-llm.py                 # reuse the existing session, else create one, then print the URL
-    ./colab-llm.py --stop          # stop the VM (do this; idle VMs burn compute units)
-    ./colab-llm.py --model 14b     # swap the served model
-    ./colab-llm.py --ctx 32768     # shrink context to trade KV cache for speed
-    ./colab-llm.py --no-register   # skip writing the omp provider
+    ./colab-llm.py                 # reuse the running server (instant), else set it up, then print the URL
+    ./colab-llm.py --status        # check the endpoint without touching Colab
+    ./colab-llm.py --stop          # close the tunnel and stop the VM (idle VMs burn compute units)
+    ./colab-llm.py --watch         # keep the VM alive and repair the tunnel/server/session when they die
+    ./colab-llm.py --model 14b     # swap the served model (both stay cached on the VM)
+    ./colab-llm.py --ctx 32768     # override the per-model context default
+    ./colab-llm.py --tunnel cloudflare   # public https URL instead of the local ssh tunnel
+    ./colab-llm.py --no-register   # skip writing the omp/fx provider
 
 State is remote: /content survives between runs inside one session, so a second invocation
 reuses the downloaded llama.cpp build, the model weights, and the running server. If the
 session is gone, everything is rebuilt from scratch.
 
+The default tunnel is `colab ssh` with a local port forward, so the endpoint is always
+http://127.0.0.1:PORT/v1: it never changes, and it is not public. The ssh master runs in the
+background after this script exits; `--stop` closes it.
+
 The script also writes/updates the `uncensored` provider so both agents can use the model:
 omp via ~/.omp/agent/models.yml (then `omp --model uncensored/abliterated`) and fx via
-~/.fx/settings.json (then `fx provider uncensored`).
+~/.fx/settings.json (then `fx provider uncensored`). It writes them only when the URL changes.
 """
 
 from __future__ import annotations
@@ -22,136 +29,209 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 MODELS_YML = Path.home() / ".omp" / "agent" / "models.yml"
 FX_SETTINGS = Path.home() / ".fx" / "settings.json"
+STATE_DIR = Path.home() / ".cache" / "colab-llm"
+# ssh control sockets must fit in sun_path (108 bytes), so keep them in the short runtime dir.
+SOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
 PROVIDER_ID = "uncensored"
 MODEL_ALIAS = "abliterated"
 BUILD = "b11696"
+CLOUDFLARED = "2026.10.0"
+KV_TYPE = "q8_0"
+REMOTE_PORT = 8000  # Colab itself owns 8080
 
-# name -> (hf url, quant label, approx GiB). Q4_K_M keeps a 9B well inside the T4's 15 GB
-# even at 128k context, because Qwen3.5's hybrid attention makes its KV cache unusually cheap.
+# name -> hf url, approx file GiB, default context. Q4_K_M weights.
 MODELS = {
-    "9b": (
-        "https://huggingface.co/mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF/resolve/main/"
-        "Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf",
-        5.24,
-    ),
-    "14b": (
-        "https://huggingface.co/mradermacher/Huihui-Qwen3-14B-abliterated-v2-GGUF/resolve/main/"
-        "Huihui-Qwen3-14B-abliterated-v2.Q4_K_M.gguf",
-        8.38,
-    ),
+    "9b": {
+        "url": "https://huggingface.co/mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF/resolve/main/"
+               "Huihui-Qwen3.5-9B-abliterated.Q4_K_M.gguf",
+        "gib": 5.24,
+        "ctx": 204800,
+    },
+    "14b": {
+        "url": "https://huggingface.co/mradermacher/Huihui-Qwen3-14B-abliterated-v2-GGUF/resolve/main/"
+               "Huihui-Qwen3-14B-abliterated-v2.Q4_K_M.gguf",
+        "gib": 8.38,
+        "ctx": 32768,
+    },
 }
 
+# Runs inside the Colab kernel. Parameters arrive as LLM_* env vars (colab exec --env), so this
+# is plain Python with no template escaping. Lines starting with [vm] stream back as progress.
 REMOTE = r'''
-import json, os, re, subprocess, sys, time
+import json, os, re, subprocess, time, urllib.request
 
-BUILD      = {build!r}
-MODEL_URL  = {model_url!r}
-CTX        = {ctx}
-CUDART     = f"/content/llama/cudart-llama-{{BUILD}}-bin-ubuntu-cuda-12.8-x64"
-BIN        = f"/content/llama/llama-{{BUILD}}"
-# /usr/lib64-nvidia holds libcuda.so.1. Assigning LD_LIBRARY_PATH instead of appending
-# drops it, libcuda resolves to "not found", and llama.cpp silently runs on CPU.
-LDP        = f"/usr/lib64-nvidia:{{CUDART}}:{{BIN}}"
-MODEL_PATH = "/content/models/model.gguf"
-PORT       = 8000  # Colab itself owns 8080
-LOGF       = "/content/server.log"
+def _llm_main():
+    E = os.environ
+    BUILD, ALIAS, KV = E["LLM_BUILD"], E["LLM_ALIAS"], E["LLM_KV"]
+    MODEL_URL, MIN_GIB, CTX = E["LLM_MODEL_URL"], float(E["LLM_MIN_GIB"]), int(E["LLM_CTX"])
+    TUNNEL, PREFIX, PORT = E["LLM_TUNNEL"], E.get("LLM_PREFIX", ""), int(E["LLM_PORT"])
+    FORCE_TUNNEL = E.get("LLM_FORCE_TUNNEL") == "1"
+    CUDART = f"/content/llama/cudart-llama-{BUILD}-bin-ubuntu-cuda-12.8-x64"
+    BIN = f"/content/llama/llama-{BUILD}"
+    # /usr/lib64-nvidia holds libcuda.so.1. Assigning LD_LIBRARY_PATH instead of appending
+    # drops it, libcuda resolves to "not found", and llama.cpp silently runs on CPU.
+    LDP = f"/usr/lib64-nvidia:{CUDART}:{BIN}"
+    MODEL_PATH = f"/content/models/{os.path.basename(MODEL_URL)}"
+    LOGF = "/content/server.log"
+    BASE = f"http://127.0.0.1:{PORT}{PREFIX}"
+    t0 = time.time()
 
-os.environ["LD_LIBRARY_PATH"] = LDP
-os.makedirs("/content/llama", exist_ok=True)
-os.makedirs("/content/models", exist_ok=True)
+    def log(msg):
+        print(f"[vm] {msg}", flush=True)
 
-def sh(cmd):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+    def result(**kw):
+        print("__RESULT__" + json.dumps(kw), flush=True)
 
-CURL_CODE = "%{{http_code}}"   # curl's status-code placeholder, kept out of an f-string
+    def sh(cmd):
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
 
-def health():
-    return sh(f"curl -s -o /dev/null -w '{{CURL_CODE}}' http://127.0.0.1:{{PORT}}/health") == "200"
+    def get(url, timeout=5):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.read() if r.status == 200 else None
+        except Exception:
+            return None
 
-def download(url, dest, minimum):
-    if os.path.exists(dest) and os.path.getsize(dest) >= minimum:
-        return "cached"
-    subprocess.run(f"curl -sL --retry 3 -o {{dest}} '{{url}}'", shell=True, check=True)
-    return "downloaded"
+    os.makedirs("/content/llama", exist_ok=True)
+    os.makedirs("/content/models", exist_ok=True)
 
-# ---- llama.cpp ----
-if not os.path.exists(f"{{BIN}}/llama-server"):
-    base = f"https://github.com/ggml-org/llama.cpp/releases/download/{{BUILD}}"
-    for name in (f"cudart-llama-{{BUILD}}-bin-ubuntu-cuda-12.8-x64.tar.gz",
-                 f"llama-{{BUILD}}-bin-ubuntu-cuda-12.8-x64.tar.gz"):
-        subprocess.run(f"cd /content/llama && curl -sL -O {{base}}/{{name}} && tar xzf {{name}}",
+    # ---- model: start first, it is the long pole; everything else downloads meanwhile ----
+    dl, part = "cached", MODEL_PATH + ".part"
+    curl = None
+    if not os.path.exists(MODEL_PATH):
+        dl = "downloaded"
+        # -C - resumes a .part left by an interrupted run; the rename marks a complete file.
+        curl = subprocess.Popen(["curl", "-fsSL", "--retry", "5", "-C", "-", "-o", part, MODEL_URL])
+        log(f"model: downloading {os.path.basename(MODEL_PATH)} (~{MIN_GIB:.1f} GiB)")
+
+    # ---- llama.cpp ----
+    if not os.path.exists(f"{BIN}/llama-server"):
+        log(f"llama.cpp: downloading {BUILD}")
+        base = f"https://github.com/ggml-org/llama.cpp/releases/download/{BUILD}"
+        for name in (f"cudart-llama-{BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                     f"llama-{BUILD}-bin-ubuntu-cuda-12.8-x64.tar.gz"):
+            subprocess.run(f"cd /content/llama && curl -fsSL -O {base}/{name} && tar xzf {name} && rm {name}",
+                           shell=True, check=True)
+    env = dict(os.environ, LD_LIBRARY_PATH=LDP)
+    dev = subprocess.run([f"{BIN}/llama-server", "--list-devices"], env=env,
+                         capture_output=True, text=True).stdout
+    if "CUDA0" not in dev:
+        return result(error="no CUDA device; LD_LIBRARY_PATH broke or the VM has no GPU", devices=dev)
+
+    # ---- cloudflared (only for the public tunnel) ----
+    CF = "/content/cloudflared"
+    if TUNNEL == "cloudflare" and not os.path.exists(CF):
+        subprocess.run(f"curl -fsSL -o {CF} https://github.com/cloudflare/cloudflared/releases/download/"
+                       f"{E['LLM_CLOUDFLARED']}/cloudflared-linux-amd64 && chmod +x {CF}",
                        shell=True, check=True)
 
-dev = sh(f"{{BIN}}/llama-server --list-devices")
-if "CUDA0" not in dev:
-    print(json.dumps({{"error": "no CUDA device; LD_LIBRARY_PATH broke", "devices": dev}})); sys.exit(1)
+    if curl:
+        while curl.poll() is None:
+            time.sleep(10)
+            got = os.path.getsize(part) / 2**30 if os.path.exists(part) else 0
+            log(f"model: {got:.1f} / ~{MIN_GIB:.1f} GiB ({time.time() - t0:.0f}s)")
+        if curl.returncode:
+            return result(error=f"model download failed (curl exit {curl.returncode}); rerun to resume")
+        os.replace(part, MODEL_PATH)
+    size_gib = os.path.getsize(MODEL_PATH) / 2**30
+    if size_gib < MIN_GIB - 0.5:
+        os.remove(MODEL_PATH)
+        return result(error=f"model truncated: {size_gib:.2f} GiB; deleted, rerun to download again")
 
-# ---- model ----
-dl = download(MODEL_URL, MODEL_PATH, int({min_bytes}))
-size_gib = os.path.getsize(MODEL_PATH) / 2**30
-if size_gib < {min_gib} - 0.5:
-    print(json.dumps({{"error": f"model truncated: {{size_gib:.2f}} GiB"}})); sys.exit(1)
+    # ---- server: restart only if the running one was started with different arguments ----
+    args = [f"{BIN}/llama-server", "--model", MODEL_PATH, "--host", "127.0.0.1", "--port", str(PORT),
+            "--alias", ALIAS, "--ctx-size", str(CTX), "--n-gpu-layers", "999", "--threads", "2",
+            "--jinja", "--flash-attn", "on", "--cache-type-k", KV, "--cache-type-v", KV]
+    if PREFIX:
+        args += ["--api-prefix", PREFIX]
+    running = sh("pgrep -a -f '^/content/llama/.*/llama-server'").splitlines()
+    if not (len(running) == 1 and running[0].split(" ", 1)[1] == " ".join(args) and get(BASE + "/health")):
+        if running:
+            log("server: restarting with new arguments")
+            subprocess.run("pkill -f '^/content/llama/.*/llama-server'", shell=True)
+            for _ in range(20):  # the VRAM must be free before the new server allocates it
+                if not sh("pgrep -f '^/content/llama/.*/llama-server'"):
+                    break
+                time.sleep(0.5)
+            else:
+                subprocess.run("pkill -9 -f '^/content/llama/.*/llama-server'", shell=True)
+                time.sleep(1)
+        with open(LOGF, "w") as out:
+            proc = subprocess.Popen(args, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+        log(f"server: loading {os.path.basename(MODEL_PATH)} with ctx {CTX}")
+        for i in range(600):
+            if get(BASE + "/health"):
+                break
+            if proc.poll() is not None:
+                return result(error="server exited during load", log=open(LOGF, errors="ignore").read()[-1500:])
+            if i and i % 15 == 0:
+                log(f"server: still loading ({i}s)")
+            time.sleep(1)
+        else:
+            return result(error="server never became healthy", log=open(LOGF, errors="ignore").read()[-1500:])
 
-# ---- server: restart only if the running one does not match ----
-want = f"--ctx-size {{CTX}}"
-running = sh("pgrep -af 'llama-server --model'")
-if not (health() and want in running):
-    subprocess.run("pkill -f llama-server || true", shell=True); time.sleep(3)
-    subprocess.run(
-        f"cd /content && LD_LIBRARY_PATH={{LDP}} setsid nohup {{BIN}}/llama-server "
-        f"--model {{MODEL_PATH}} --host 0.0.0.0 --port {{PORT}} --alias {alias!r} "
-        f"--ctx-size {{CTX}} --n-gpu-layers 999 --threads 2 --jinja "
-        f"> {{LOGF}} 2>&1 < /dev/null &", shell=True)
-    for _ in range(60):
-        time.sleep(5)
-        if health(): break
-    else:
-        print(json.dumps({{"error": "server never became healthy",
-                           "log": open(LOGF, errors="ignore").read()[-600:]}})); sys.exit(1)
+    # ---- cloudflared tunnel ----
+    url = None
+    if TUNNEL == "cloudflare":
+        cflog = "/content/cf.log"
+        pat = r"https://[a-z0-9-]+\.trycloudflare\.com"
+        m = re.search(pat, open(cflog, errors="ignore").read()) if os.path.exists(cflog) else None
+        # A live cloudflared PROCESS is not proof the tunnel WORKS, so recovery
+        # (FORCE_TUNNEL) always mints a fresh one.
+        if m and not FORCE_TUNNEL and sh("pgrep -f '^/content/cloudflared tunnel'"):
+            url = m.group(0)
+        else:
+            subprocess.run("pkill -f '^/content/cloudflared tunnel'", shell=True)
+            time.sleep(1)
+            with open(cflog, "w") as out:
+                subprocess.Popen([CF, "tunnel", "--url", f"http://127.0.0.1:{PORT}", "--no-autoupdate"],
+                                 stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+            for _ in range(120):
+                time.sleep(0.5)
+                m = re.search(pat, open(cflog, errors="ignore").read())
+                if m:
+                    url = m.group(0)
+                    break
+            if not url:
+                return result(error="no tunnel URL", log=open(cflog, errors="ignore").read()[-800:])
+            # Wait until the edge serves it. Probing a fresh hostname from the laptop too early
+            # makes the local resolver cache NXDOMAIN, which then hides the tunnel for ~90s.
+            log("tunnel: waiting for the Cloudflare edge")
+            for _ in range(60):
+                if get(url + PREFIX + "/health"):
+                    break
+                time.sleep(1)
 
-# ---- cloudflared ----
-CF = "/content/cloudflared"
-if not os.path.exists(CF):
-    subprocess.run(f"curl -sL -o {{CF}} https://github.com/cloudflare/cloudflared/releases/latest/"
-                   "download/cloudflared-linux-amd64 && chmod +x " + CF, shell=True, check=True)
+    meta = (json.loads(get(BASE + "/v1/models") or b"{}").get("data") or [{}])[0].get("meta", {})
+    result(ok=True, url=url, n_ctx=meta.get("n_ctx"), n_ctx_train=meta.get("n_ctx_train"),
+           model_gib=round(size_gib, 2), download=dl,
+           vram=sh("nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader"))
 
-url = None
-log = open("/content/cf.log", errors="ignore").read() if os.path.exists("/content/cf.log") else ""
-m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log)
-# Reuse only on a normal bootstrap. A live cloudflared PROCESS is not proof the
-# tunnel WORKS, so recovery (FORCE_TUNNEL) always mints a fresh one.
-if m and not {FORCE_TUNNEL} and sh("pgrep -f 'cloudflared tunnel'"):
-    url = m.group(0)
-else:
-    subprocess.run("pkill -f 'cloudflared tunnel' || true", shell=True); time.sleep(2)
-    subprocess.run(f"cd /content && setsid nohup {{CF}} tunnel --url http://localhost:{{PORT}} "
-                   "--no-autoupdate > /content/cf.log 2>&1 < /dev/null &", shell=True)
-    for _ in range(40):
-        time.sleep(3)
-        m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com",
-                      open("/content/cf.log", errors="ignore").read())
-        if m: url = m.group(0); break
-
-if not url:
-    print(json.dumps({{"error": "no tunnel URL"}})); sys.exit(1)
-
-props = json.loads(sh(f"curl -s http://127.0.0.1:{{PORT}}/props"))
-n_ctx = props.get("default_generation_settings", {{}}).get("n_ctx")
-vram = sh("nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader")
-print("__RESULT__" + json.dumps(
-    {{"url": url, "n_ctx": n_ctx, "model_gib": round(size_gib, 2),
-      "download": dl, "vram": vram, "ok": True}}))
+_llm_main()
 '''
+
+
+def log(msg: str) -> None:
+    print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
 def colab(*args: str, timeout: int | None = None) -> subprocess.CompletedProcess:
@@ -165,48 +245,144 @@ def session_exists(name: str) -> bool:
 
 def ensure_session(name: str, gpu: str) -> None:
     if session_exists(name):
-        print(f"[llm] reusing session '{name}'", flush=True)
+        log(f"reusing session '{name}'")
         return
-    print(f"[llm] creating session '{name}' ({gpu})", flush=True)
+    log(f"creating session '{name}' ({gpu})")
     r = colab("new", "-s", name, "--gpu", gpu, timeout=600)
     if r.returncode != 0:
-        sys.exit(f"colab new failed:\n{r.stdout}\n{r.stderr}")
+        out = r.stdout + r.stderr
+        if "Service Unavailable" in out or "Too Many Requests" in out:
+            raise RuntimeError(f"Colab has no {gpu} for this account right now (capacity or free-tier "
+                               "usage limit). Retry later, or use --watch to keep retrying.")
+        raise RuntimeError(f"colab new failed:\n{out[-1500:]}")
 
 
-def remote_bootstrap(name: str, model: str, ctx: int, force_tunnel: bool = False) -> dict:
-    url, approx = MODELS[model]
-    script = REMOTE.format(
-        build=BUILD, model_url=url, ctx=ctx, alias=MODEL_ALIAS,
-        min_bytes=int(approx * 0.98 * 2**30), min_gib=approx,
-        FORCE_TUNNEL=force_tunnel,
-    )
+def model_file(model: str) -> str:
+    return MODELS[model]["url"].rsplit("/", 1)[1]
+
+
+def remote_bootstrap(a: argparse.Namespace, prefix: str, force_tunnel: bool = False) -> dict:
+    m = MODELS[a.model]
+    env = {
+        "LLM_BUILD": BUILD, "LLM_ALIAS": MODEL_ALIAS, "LLM_KV": KV_TYPE, "LLM_MODEL_URL": m["url"],
+        "LLM_MIN_GIB": str(m["gib"]), "LLM_CTX": str(a.ctx), "LLM_TUNNEL": a.tunnel,
+        "LLM_PREFIX": prefix, "LLM_PORT": str(REMOTE_PORT), "LLM_CLOUDFLARED": CLOUDFLARED,
+        "LLM_FORCE_TUNNEL": "1" if force_tunnel else "0",
+    }
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
-        fh.write(script)
+        fh.write(REMOTE)
         path = fh.name
+    cmd = ["colab", "exec", "-s", a.session, "-f", path, "--timeout", "2400"]
+    for k, v in env.items():
+        cmd += ["--env", f"{k}={v}"]
+    log("bootstrapping runtime (downloads on first use)")
+    tail: list[str] = []
     try:
-        print("[llm] bootstrapping runtime (downloads on first use)", flush=True)
-        r = colab("exec", "-s", name, "-f", path, "--timeout", "1800", timeout=2400)
+        # colab exec streams the kernel's output live, so progress shows up as it happens.
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as p:
+            for line in p.stdout:
+                line = line.rstrip("\n")
+                if line.startswith("__RESULT__"):
+                    res = json.loads(line[len("__RESULT__"):])
+                    if "error" in res:
+                        raise RuntimeError("bootstrap failed: " + "\n".join(
+                            str(v) for v in (res["error"], res.get("log"), res.get("devices")) if v))
+                    return res
+                if line.startswith("[vm] "):
+                    log(line)
+                tail = (tail + [line])[-40:]
     finally:
         os.unlink(path)
-    out = r.stdout + r.stderr
-    for line in out.splitlines():
-        if line.startswith("__RESULT__"):
-            return json.loads(line[len("__RESULT__"):])
-    sys.exit(f"bootstrap failed:\n{out[-1500:]}")
+    raise RuntimeError("bootstrap failed:\n" + "\n".join(tail))
+
+
+# ---- ssh tunnel: one background ssh master per session, addressed by its control socket ----
+
+def ssh(session: str, *opts: str) -> list[str]:
+    """ssh argv for this session's master; options must precede the host or ssh runs them remotely."""
+    return ["ssh", "-S", str(SOCK_DIR / f"colab-llm-{session}.sock"),
+            "-o", f"ProxyCommand=colab ssh --proxy-mode -s {shlex.quote(session)}",
+            # Every VM has a new host key, and the proxy already authenticates through Google.
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "LogLevel=ERROR", "-o", "BatchMode=yes", *opts, f"root@colab-{session}"]
+
+
+def tunnel_up(session: str) -> bool:
+    return subprocess.run(ssh(session, "-O", "check"), capture_output=True).returncode == 0
+
+
+def stop_tunnel(session: str) -> None:
+    subprocess.run(ssh(session, "-O", "exit"), capture_output=True)
+
+
+def start_tunnel(session: str, port: int) -> None:
+    stop_tunnel(session)
+    # -f returns once the forward is listening. ServerAlive drops a dead link after ~45s,
+    # so a stale master never blocks the next run. The forked master keeps any pipe open,
+    # so its stderr goes to a file, not to capture_output.
+    with tempfile.TemporaryFile("w+") as err:
+        r = subprocess.run(ssh(session, "-M", "-f", "-N", "-o", "ExitOnForwardFailure=yes",
+                               "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+                               "-L", f"127.0.0.1:{port}:127.0.0.1:{REMOTE_PORT}"),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err, timeout=120)
+        err.seek(0)
+        if r.returncode != 0:
+            raise RuntimeError(f"ssh tunnel failed: {err.read().strip()}")
+
+
+def props(base: str, timeout: int = 15) -> dict | None:
+    """llama-server /props, or None when the endpoint does not answer."""
+    try:
+        with urllib.request.urlopen(f"{base}/props", timeout=timeout) as r:
+            return json.load(r) if r.status == 200 else None
+    except Exception:
+        return None
+
+
+def matches(p: dict | None, a: argparse.Namespace) -> bool:
+    return bool(p) and (os.path.basename(p.get("model_path", "")) == model_file(a.model)
+                        and p.get("default_generation_settings", {}).get("n_ctx") == a.ctx)
+
+
+# ---- local state: the endpoint base and the cloudflare path secret ----
+
+def load_state(session: str) -> dict:
+    try:
+        return json.loads((STATE_DIR / f"{session}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(session: str, st: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{session}.json").write_text(json.dumps(st))
+
+
+# ---- agent configs ----
+
+def write_config(path: Path, text: str) -> None:
+    """Atomic write that keeps the file mode and backs up the user's original once."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    if path.exists():
+        bak = path.with_name(path.name + ".bak")
+        if not bak.exists():
+            shutil.copy2(path, bak)
+        shutil.copymode(path, tmp)
+    os.replace(tmp, path)
 
 
 def register_omp(url: str, ctx: int) -> None:
-    import yaml
-
-    MODELS_YML.parent.mkdir(parents=True, exist_ok=True)
-    data = {}
-    if MODELS_YML.exists():
-        data = yaml.safe_load(MODELS_YML.read_text()) or {}
+    if yaml is None:
+        log("PyYAML is not installed; skipping omp registration (pip install pyyaml)")
+        return
+    data = yaml.safe_load(MODELS_YML.read_text()) or {} if MODELS_YML.exists() else {}
     providers = data.setdefault("providers", {})
-    providers[PROVIDER_ID] = {
-        "baseUrl": f"{url}/v1",
+    entry = {
+        "baseUrl": url,
         "api": "openai-completions",
-        "auth": "none",  # llama-server is keyless
+        "auth": "none",  # llama-server is keyless; the ssh tunnel is local, cloudflare uses a secret path
         "discovery": {"type": "openai-models-list", "injectV1": False},  # baseUrl already ends in /v1
         "models": [{
             "id": MODEL_ALIAS,
@@ -218,30 +394,29 @@ def register_omp(url: str, ctx: int) -> None:
             "maxTokens": 8192,
         }],
     }
-    if MODELS_YML.exists():
-        MODELS_YML.with_suffix(".yml.bak").write_text(MODELS_YML.read_text())
-    MODELS_YML.write_text(yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
-    print(f"[llm] registered provider '{PROVIDER_ID}' in {MODELS_YML}")
+    if providers.get(PROVIDER_ID) == entry:
+        return
+    providers[PROVIDER_ID] = entry
+    # Note: safe_dump drops comments in models.yml. Writing only on change keeps that rare.
+    write_config(MODELS_YML, yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+    log(f"registered provider '{PROVIDER_ID}' in {MODELS_YML}")
 
 
 def register_fx(url: str, ctx: int) -> None:
     """Write a custom model connection into ~/.fx/settings.json."""
     if not shutil.which("fx"):
-        print("[llm] fx not on PATH; skipping fx registration")
+        log("fx not on PATH; skipping fx registration")
         return
-
-    FX_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
     if FX_SETTINGS.exists():
         try:
             data = json.loads(FX_SETTINGS.read_text()) or {}
         except json.JSONDecodeError as e:
-            print(f"[llm] {FX_SETTINGS} is not valid JSON ({e}); leaving it untouched")
+            log(f"{FX_SETTINGS} is not valid JSON ({e}); leaving it untouched")
             return
-
-    data.setdefault("providers", {})[PROVIDER_ID] = {
+    entry = {
         "protocol": "openai-chat-completions",
-        "base_url": f"{url}/v1",  # fx appends /chat/completions
+        "base_url": url,  # fx appends /chat/completions
         "auth": {"type": "none"},  # llama-server is keyless
         "model_metadata": {
             # Without context_window fx cannot compute its auto-compaction threshold.
@@ -253,26 +428,77 @@ def register_fx(url: str, ctx: int) -> None:
             }
         },
     }
+    if data.get("providers", {}).get(PROVIDER_ID) == entry and data.get("models", {}).get(PROVIDER_ID) == MODEL_ALIAS:
+        return
+    data.setdefault("providers", {})[PROVIDER_ID] = entry
     data.setdefault("models", {})[PROVIDER_ID] = MODEL_ALIAS
     # Deliberately NOT touching data["provider"]: that would hijack the active provider
     # (currently the Codex subscription). Activate with `fx provider uncensored`.
-
-    if FX_SETTINGS.exists():
-        FX_SETTINGS.with_suffix(".json.bak").write_text(FX_SETTINGS.read_text())
-    FX_SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
-    print(f"[llm] registered connection '{PROVIDER_ID}' in {FX_SETTINGS}")
+    write_config(FX_SETTINGS, json.dumps(data, indent=2) + "\n")
+    log(f"registered connection '{PROVIDER_ID}' in {FX_SETTINGS}")
 
 
-def probe(url: str, timeout: int = 30) -> bool:
-    """True when the tunnel answers /health with 200."""
-    import urllib.error
-    import urllib.request
+# ---- the whole bring-up ----
 
-    try:
-        with urllib.request.urlopen(f"{url}/health", timeout=timeout) as r:
-            return r.status == 200
-    except Exception:
-        return False
+def serve(a: argparse.Namespace, force_tunnel: bool = False) -> tuple[str, dict]:
+    """Make the endpoint answer with the requested model and ctx. Returns (base, bootstrap info)."""
+    st = load_state(a.session)
+    if a.tunnel == "ssh":
+        base = f"http://127.0.0.1:{a.port}"
+        # Fast path: the tunnel and server already match, so no Colab call at all.
+        if not force_tunnel and st.get("base") == base and tunnel_up(a.session) and matches(props(base), a):
+            return base, {}
+        ensure_session(a.session, a.gpu)
+        info = remote_bootstrap(a, prefix="")
+        if not (tunnel_up(a.session) and props(base)):
+            log(f"ssh tunnel: forwarding 127.0.0.1:{a.port}")
+            start_tunnel(a.session, a.port)
+    else:
+        prefix = st.get("prefix") or "/" + secrets.token_urlsafe(16)
+        if not force_tunnel and st.get("tunnel") == "cloudflare" and matches(props(st.get("base", "")), a):
+            return st["base"], {}
+        ensure_session(a.session, a.gpu)
+        info = remote_bootstrap(a, prefix=prefix, force_tunnel=force_tunnel)
+        base = info["url"] + prefix
+        st["prefix"] = prefix
+    if not props(base, timeout=30):
+        raise RuntimeError(f"the server is up on the VM, but {base} does not answer")
+    save_state(a.session, {**st, "tunnel": a.tunnel, "base": base})
+    if a.register:
+        register_omp(f"{base}/v1", info.get("n_ctx") or a.ctx)
+        register_fx(f"{base}/v1", info.get("n_ctx") or a.ctx)
+    return base, info
+
+
+def report(a: argparse.Namespace, base: str, info: dict) -> None:
+    print(f"\nBASE_URL={base}/v1")
+    print(f"MODEL={MODEL_ALIAS}")
+    if info:
+        train = info.get("n_ctx_train")
+        print(f"context={info['n_ctx']} (trained {train})  model={info['model_gib']} GiB ({info['download']})  "
+              f"VRAM={info['vram']}")
+        if train and info["n_ctx"] and info["n_ctx"] > train:
+            print(f"warning: ctx {info['n_ctx']} exceeds the model's trained context {train}; "
+                  "quality drops past it")
+        notify(f"{base}/v1")
+    else:
+        print("(already running; nothing changed)")
+    print(f"\nexport OPENAI_BASE_URL={base}/v1")
+    print("export OPENAI_API_KEY=none")
+    if a.register:
+        print(f"\n  omp --model {PROVIDER_ID}/{MODEL_ALIAS}   # directly")
+        print(f"  fx provider {PROVIDER_ID}                # then just: fx")
+    print(f"\nstop it with: {shlex.join([sys.argv[0], '--session', a.session, '--stop'])}")
+
+
+def notify(url: str) -> None:
+    """Desktop ping and clipboard copy: the first bring-up takes minutes."""
+    # wl-copy forks to serve the clipboard, so a captured pipe would never close.
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if shutil.which("wl-copy"):
+        subprocess.run(["wl-copy", url], **quiet)
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "colab-llm", "Colab LLM ready", f"{url} (copied)"], **quiet)
 
 
 def poke_kernel(session: str) -> bool:
@@ -287,43 +513,66 @@ def poke_kernel(session: str) -> bool:
     return r.returncode == 0
 
 
-def watch(session: str, gpu: str, model: str, ctx: int, interval: int, register: bool) -> int:
-    r = remote_bootstrap(session, model, ctx)
-    url = r["url"]
-    if register:
-        register_omp(url, ctx)
-        register_fx(url, ctx)
-    print(f"\n[watch] serving {url}/v1  (heartbeat every {interval}s, Ctrl-C to stop)", flush=True)
+def watch(a: argparse.Namespace) -> int:
     failures = 0
+    while True:  # first bring-up retries too, so --watch also waits out "no GPU available"
+        try:
+            base, info = serve(a)
+            report(a, base, info)
+            break
+        except RuntimeError as e:
+            failures += 1
+            log(f"[watch] {e}; retrying in {min(300, 30 * failures)}s")
+            time.sleep(min(300, 30 * failures))
+    log(f"[watch] serving {base}/v1  (heartbeat every {a.interval}s, Ctrl-C to stop)")
+    strikes = failures = 0
     while True:
         try:
-            time.sleep(interval)
-            alive = poke_kernel(session)
-            healthy = probe(url)
+            # After a failed check, look again soon instead of a full interval.
+            time.sleep(a.interval if strikes == 0 else 30)
+            alive = poke_kernel(a.session)
+            healthy = props(base) is not None
+            if alive and not healthy and a.tunnel == "ssh":
+                log("[watch] endpoint down, kernel up: reconnecting the ssh tunnel")
+                start_tunnel(a.session, a.port)
+                healthy = props(base) is not None
             if alive and healthy:
-                failures = 0
-                print(f"[watch] ok  kernel=up  endpoint=up", flush=True)
+                strikes = failures = 0
+                log("[watch] ok  kernel=up  endpoint=up")
                 continue
+            strikes += 1
+            log(f"[watch] degraded (kernel={'up' if alive else 'DOWN'}, "
+                f"endpoint={'up' if healthy else 'DOWN'}), strike {strikes}/2")
+            if strikes < 2:  # one slow probe is not worth a new VM or a new URL
+                continue
+            # Only cloudflare needs a fresh tunnel; ssh reconnects to the same local port.
+            new_base, _ = serve(a, force_tunnel=a.tunnel == "cloudflare")
+            strikes = 0
+            log(f"[watch] recovered: {new_base}/v1" + ("" if new_base == base else "  (URL changed)"))
+            base = new_base
+        except (RuntimeError, subprocess.SubprocessError, OSError) as e:
             failures += 1
-            print(f"[watch] degraded (kernel={'up' if alive else 'DOWN'}, "
-                  f"endpoint={'up' if healthy else 'DOWN'}) — recovering", flush=True)
-            if not session_exists(session):
-                print("[watch] session was reclaimed; creating a new one", flush=True)
-                colab("new", "-s", session, "--gpu", gpu, timeout=600)
-            r = remote_bootstrap(session, model, ctx, force_tunnel=True)
-            url = r["url"]
-            if register:
-                register_omp(url, ctx)
-                register_fx(url, ctx)
-            print(f"[watch] recovered: {url}/v1", flush=True)
-        except KeyboardInterrupt:
-            print("\n[watch] stopped; the VM is still running — stop it with "
-                  f"'colab stop -s {session}'", flush=True)
-            return 0
-        except Exception as e:  # network hiccup, CLI error, etc.
-            failures += 1
-            print(f"[watch] error ({e}); retrying", flush=True)
+            log(f"[watch] error ({e}); retrying")
             time.sleep(min(60, 5 * failures))
+
+
+def stop(a: argparse.Namespace) -> int:
+    stop_tunnel(a.session)
+    r = colab("stop", "-s", a.session, timeout=300)
+    print((r.stdout + r.stderr).strip() or "stopped")
+    (STATE_DIR / f"{a.session}.json").unlink(missing_ok=True)
+    return r.returncode
+
+
+def status(a: argparse.Namespace) -> int:
+    base = load_state(a.session).get("base")
+    p = props(base) if base else None
+    if not p:
+        print(f"down ({base or 'never started'})")
+        return 1
+    print(f"up  {base}/v1  model={os.path.basename(p.get('model_path', '?'))}  "
+          f"ctx={p.get('default_generation_settings', {}).get('n_ctx')}")
+    return 0
 
 
 def main() -> int:
@@ -331,40 +580,40 @@ def main() -> int:
     p.add_argument("--session", default="llm")
     p.add_argument("--gpu", default="T4")
     p.add_argument("--model", default="9b", choices=sorted(MODELS))
-    p.add_argument("--ctx", type=int, default=204800)
-    p.add_argument("--stop", action="store_true", help="stop the session and exit")
+    p.add_argument("--ctx", type=int, help="context size (default: per model, see MODELS)")
+    p.add_argument("--tunnel", default="ssh", choices=["ssh", "cloudflare"],
+                   help="ssh: stable local URL (default); cloudflare: public https URL with a secret path")
+    p.add_argument("--port", type=int, default=8765, help="local port for the ssh tunnel (default 8765)")
+    p.add_argument("--status", action="store_true", help="check the endpoint without calling Colab")
+    p.add_argument("--stop", action="store_true", help="close the tunnel, stop the session, and exit")
     p.add_argument("--watch", action="store_true",
                    help="keep the VM alive with a kernel heartbeat and auto-recover when it dies")
+    p.add_argument("--stop-on-exit", action="store_true", help="with --watch: stop the VM on Ctrl-C")
     p.add_argument("--interval", type=int, default=300, help="heartbeat interval in seconds (default 300)")
-    p.add_argument("--register", dest="register", action="store_true", default=True)
-    p.add_argument("--no-register", dest="register", action="store_false")
+    p.add_argument("--register", action=argparse.BooleanOptionalAction, default=True,
+                   help="write the omp/fx provider (default on)")
     a = p.parse_args()
+    a.ctx = a.ctx or MODELS[a.model]["ctx"]
 
     if a.stop:
-        print(colab("stop", "-s", a.session, timeout=300).stdout.strip() or "stopped")
+        return stop(a)
+    if a.status:
+        return status(a)
+    try:
+        if a.watch:
+            return watch(a)
+        base, info = serve(a)
+        report(a, base, info)
         return 0
-
-    if a.watch:
-        ensure_session(a.session, a.gpu)
-        return watch(a.session, a.gpu, a.model, a.ctx, a.interval, a.register)
-
-    ensure_session(a.session, a.gpu)
-    r = remote_bootstrap(a.session, a.model, a.ctx)
-
-    print(f"\nBASE_URL={r['url']}/v1")
-    print(f"MODEL={MODEL_ALIAS}")
-    print(f"context={r['n_ctx']}  model={r['model_gib']} GiB ({r['download']})  ", end="")
-    print(f"VRAM={r['vram']}\n")
-
-    if a.register:
-        register_omp(r["url"], a.ctx)
-        register_fx(r["url"], a.ctx)
-        print(f"\nexport OPENAI_BASE_URL={r['url']}/v1")
-        print(f"export OPENAI_API_KEY=none")
-        print(f"\n  omp --model {PROVIDER_ID}/{MODEL_ALIAS}   # directly")
-        print(f"  fx provider {PROVIDER_ID}                # then just: fx")
-    print(f"\nstop it with: {shlex.join([sys.argv[0], '--session', a.session, '--stop'])}")
-    return 0
+    except KeyboardInterrupt:
+        if a.watch and a.stop_on_exit:
+            print()
+            return stop(a)
+        print(f"\ninterrupted; the VM is still running. Stop it with "
+              f"'{shlex.join([sys.argv[0], '--session', a.session, '--stop'])}'")
+        return 130
+    except (RuntimeError, subprocess.SubprocessError) as e:
+        sys.exit(f"error: {e}")
 
 
 if __name__ == "__main__":
