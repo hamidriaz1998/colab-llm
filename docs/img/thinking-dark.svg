@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" width="960" height="300" role="img" aria-labelledby="title desc"><title id="title">Thinking costs time on a T4</title><desc id="desc">Two bars: with thinking off the answer takes 6.6 seconds, with thinking on 32 seconds.</desc><style>
+text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; font-variant-numeric: tabular-nums; }
+.t1 { font-size: 22px; font-weight: 650; fill: #f0efec; letter-spacing: -0.01em; }
+.t2 { font-size: 14px; fill: #c3c2b7; }
+.ax { font-size: 13px; fill: #898781; }
+.lb { font-size: 13px; fill: #c3c2b7; }
+.lbb { font-size: 13px; fill: #f0efec; font-weight: 600; }
+.big { font-size: 40px; font-weight: 650; fill: #f0efec; letter-spacing: -0.02em; font-variant-numeric: normal; }
+.fn { font-size: 12px; fill: #898781; }
+.draw { stroke-dasharray: 1; animation: draw 1.6s cubic-bezier(.22,.61,.36,1) both; }
+.pop { transform-box: fill-box; transform-origin: center; animation: pop .45s cubic-bezier(.34,1.56,.64,1) both; }
+.fade { animation: fade .7s ease-out both; }
+.grow { transform-box: fill-box; transform-origin: left center; animation: grow 1s cubic-bezier(.22,.61,.36,1) both; }
+@keyframes draw { from { stroke-dashoffset: 1; } }
+@keyframes pop { from { opacity: 0; transform: scale(.3); } }
+@keyframes fade { from { opacity: 0; } }
+@keyframes grow { from { transform: scaleX(0); } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+</style><rect x="0.5" y="0.5" width="959" height="299" rx="16" fill="#1a1a19" stroke="rgba(255,255,255,0.10)"/><text x="40.0" y="52.0" class="t1" text-anchor="start" >Thinking costs time on a T4</text><text x="40.0" y="78.0" class="t2" text-anchor="start" >The model reasons before each answer unless you turn it off, so it is off by default.</text><text x="190.0" y="138.0" class="lbb" text-anchor="end" >Thinking off</text><text x="190.0" y="156.0" class="fn" text-anchor="end" >default</text><rect x="210" y="128" width="420" height="22" rx="11" fill="#262624"/><rect x="210" y="128" width="86.6" height="22" rx="11" fill="#3987e5" class="grow" style="animation-duration:0.82s; animation-timing-function:linear; animation-delay:.4s"/><g class="fade" style="animation-delay:1.23s"><text x="308.6" y="144.0" class="lbb" text-anchor="start" >6.6 s</text><text x="352.6" y="144.0" class="lb" text-anchor="start" >149 tokens</text></g><text x="190.0" y="200.0" class="lbb" text-anchor="end" >Thinking on</text><text x="190.0" y="218.0" class="fn" text-anchor="end" >--think</text><rect x="210" y="190" width="420" height="22" rx="11" fill="#262624"/><rect x="210" y="190" width="420.0" height="22" rx="11" fill="#55544f" class="grow" style="animation-duration:4.00s; animation-timing-function:linear; animation-delay:.4s"/><g class="fade" style="animation-delay:4.40s"><text x="642.0" y="206.0" class="lbb" text-anchor="start" >32 s</text><text x="686.0" y="206.0" class="lb" text-anchor="start" >766 tokens</text></g><g class="fade" style="animation-delay:4.40s"><text x="920.0" y="162.0" class="big" text-anchor="end" >4.8×</text><text x="920.0" y="186.0" class="lb" text-anchor="end" >faster replies</text></g><text x="40.0" y="274.0" class="fn" text-anchor="start" >One request: "Write a Python function that checks if a string is a palindrome." Bars fill in scaled real time.</text></svg>

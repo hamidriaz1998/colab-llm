@@ -15,6 +15,11 @@ The default setup gives you:
   98K tokens of context.
 - A private endpoint at `http://127.0.0.1:8765/v1` that does not change between runs.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/speed-dark.svg">
+  <img alt="Line chart: generation speed falls from 25 to 15.6 tokens per second as the 9b context fills to 200K tokens with an f16 cache, and to 8.2 with a q8_0 cache. 14b starts at 14.6 and stops at 32K." src="docs/img/speed-light.svg" width="100%">
+</picture>
+
 The script is one Python file with no dependencies outside the standard library.
 PyYAML is needed only for the omp registration.
 
@@ -96,6 +101,11 @@ To serve a different GGUF model, add an entry to `MODELS` in `colab-llm.py`.
 Both models can think (reason step by step) before they answer. Thinking is off by
 default, because it makes replies much slower on a T4:
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/thinking-dark.svg">
+  <img alt="Two bars: a reply takes 6.6 seconds with thinking off and 32 seconds with thinking on, 4.8 times longer." src="docs/img/thinking-light.svg" width="100%">
+</picture>
+
 | Task | Thinking off | Thinking on |
 |---|---|---|
 | "What is 17*23?" | 4 tokens | 1481 tokens |
@@ -106,6 +116,45 @@ the omp config marks the model as a reasoning model. A client can also turn thin
 for one request: send `"chat_template_kwargs": {"enable_thinking": true}`.
 
 ## How it works
+
+```mermaid
+flowchart LR
+    subgraph PC["Your computer"]
+        direction TB
+        agent["Coding agent<br/>omp · fx · any OpenAI client"]
+        tunnel["SSH tunnel<br/>127.0.0.1:8765"]
+        script["colab-llm.py"]
+    end
+    subgraph VM["Colab VM · T4 GPU"]
+        direction TB
+        srv["llama-server<br/>listens on 127.0.0.1 only"]
+        model[("Qwen3.5 9B<br/>256K context")]
+    end
+    agent -- "OpenAI API" --> tunnel
+    tunnel == "colab ssh<br/>through Google" ==> srv
+    script -. "colab exec: setup,<br/>heartbeat" .-> srv
+    srv --> model
+    classDef accent stroke:#3987e5,stroke-width:2px
+    class tunnel,srv accent
+```
+
+Each run of the script follows this path:
+
+```mermaid
+flowchart TD
+    start(["./colab-llm.py"]) --> fast{"Already serving<br/>this setup?"}
+    fast -- yes --> quick(["Print the URL<br/>under 1 s"])
+    fast -- no --> boot["Create the T4 session if needed,<br/>download in parallel,<br/>restart the server only if needed"]
+    boot --> tun["Open the SSH tunnel"]
+    tun --> reg["Update the agent configs<br/>only if something changed"]
+    reg --> done(["Print the URL<br/>notify, copy"])
+    classDef ok stroke:#199e70,stroke-width:2px
+    class quick,done ok
+```
+
+"This setup" means the same model, context size, and thinking setting.
+
+In detail:
 
 1. The script makes sure that the Colab session exists. If not, it creates one with a T4.
 2. It sends a bootstrap script to the VM kernel with `colab exec`. The bootstrap:
@@ -125,10 +174,35 @@ The script keeps a small state file in `~/.cache/colab-llm/` and an SSH control 
 `$XDG_RUNTIME_DIR`. The fast path uses them: if the tunnel is open and the server has the
 model and context that you asked for, the script prints the URL and exits.
 
+### Recovery with `--watch`
+
+Colab stops a VM whose kernel is idle, and a network outage closes the SSH tunnel.
+`--watch` handles both. It repairs the cheapest thing first, and it rebuilds only after
+two failed checks in a row, so one slow check never costs you a new VM.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Serving
+    Serving --> Check: every 5 min
+    Check --> Serving: all up
+    Check --> Reconnect: tunnel down
+    Reconnect --> Serving: back in ~4 s
+    Reconnect --> Strike: still down
+    Check --> Strike: VM down
+    Strike --> Check: 1st strike,<br/>retry in 30 s
+    Strike --> Rebuild: 2nd strike
+    Rebuild --> Serving: new VM if needed,<br/>setup, tunnel
+```
+
 ### Tunnels
 
 The default tunnel is SSH (`colab ssh --proxy-mode`) with a local port forward. The SSH
 process runs in the background after the script exits, so the endpoint stays available.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/tunnel-dark.svg">
+  <img alt="Bar chart: time to first token is 571 ms over SSH and 976 ms over Cloudflare. SSH reconnects in 3.6 s and has no request time limit." src="docs/img/tunnel-light.svg" width="100%">
+</picture>
 
 | | SSH (default) | Cloudflare quick tunnel |
 |---|---|---|
@@ -159,7 +233,7 @@ that meets all three conditions:
    at depth 0.
 3. It is not larger than the trained context. Past that size, quality drops.
 
-**9b: 262144.** It fits with 1.6 GiB free. At 200K (75% fill), generation is 15.5 tokens
+**9b: 262144.** It fits with 1.6 GiB free. At 200K (75% fill), generation is 15.6 tokens
 per second, which is 61% of the empty-context speed. This value comes from the needle
 test, which generates only about 7 tokens per answer, so treat it as an estimate. The Qwen3.5 hybrid attention keeps
 the KV cache small, so speed drops slowly as the context fills.
@@ -168,6 +242,11 @@ the KV cache small, so speed drops slowly as the context fills.
 82% of the empty-context speed.
 
 ### VRAM use
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/vram-dark.svg">
+  <img alt="Line chart of GPU memory against context size. 9b with f16 uses 13.4 GiB at 256K; 14b with f16 reaches 14.5 GiB at 40K, inside the last GiB below the 15 GiB T4 limit." src="docs/img/vram-light.svg" width="100%">
+</picture>
 
 MiB used after the model loads, out of 15360 MiB:
 
@@ -179,6 +258,8 @@ MiB used after the model loads, out of 15360 MiB:
 | 14b | q8_0 | 9809 | 11221 | 11941 | 14101 | | | |
 
 ### Speed against context depth
+
+The chart at the top of this page shows the generation speeds below.
 
 Tokens per second, from `llama-bench` (512-token prompt, 128 generated tokens). Most rows
 come from interleaved runs in ABBA order (f16, q8_0, q8_0, f16). That order cancels the
@@ -223,6 +304,11 @@ Results:
 `bench/needle.py` hides a number at a position in filler text and asks the model for it.
 This test checks that the model still uses a long context, not only that it is fast.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/needle-dark.svg">
+  <img alt="Grid of needle-in-a-haystack results: all 6 tests pass, at 32K tokens (10, 50 and 90 percent), 128K (50 percent) and 200K (25 and 75 percent)." src="docs/img/needle-light.svg" width="100%">
+</picture>
+
 Results for 9b with the default settings (f16 KV cache, 262144 context). The speeds are
 from the server, for a full prompt without the cache:
 
@@ -236,7 +322,7 @@ from the server, for a full prompt without the cache:
 | 199959 | 75% | PASS | 447 | 15.7 | 7.6 min |
 
 The model finds the needle at every size and position that was tested. At 200K tokens,
-it still generates at 15.5 tokens per second.
+it still generates at 15.6 tokens per second.
 
 ### Tunnel performance
 
@@ -266,6 +352,8 @@ sends only a few KB per second, and that is far below what either tunnel can car
 SSH tunnel wins on latency, stability, and privacy.
 
 ### Run the benchmarks again
+
+To redraw the charts from `bench/results/`, run `python3 docs/make_charts.py`.
 
 ```sh
 # Tunnels: start bench/tunnel_server.py on the VM, then compare two base URLs.
