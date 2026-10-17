@@ -222,6 +222,19 @@ All results are from one Colab T4 (15360 MiB) in October 2026, with llama.cpp bu
 b11696, flash attention on, and all layers on the GPU. Your results can be different:
 Colab VMs vary, and a T4 slows down when it gets hot. The raw data is in `bench/results/`.
 
+The speed and VRAM numbers come from
+[`llama-bench`](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench), the
+benchmark tool in the llama.cpp release that the script downloads to the VM. Two scripts
+run it on the VM:
+
+| Script | What it runs | Time on a T4 |
+|---|---|---|
+| `bench/gpu_bench.sh` | `llama-bench` for both models at several context depths, with flash attention on and off, and with an f16 and a q8_0 KV cache. Then it starts `llama-server` at several context sizes to find what fits in VRAM. | About 30 min |
+| `bench/kv_ab.sh` | `llama-bench` again with f16 and q8_0 interleaved (f16, q8_0, q8_0, f16), so that the T4 heating up affects both equally. | About 25 min |
+
+Each `llama-bench` test fills the context to a given depth, then measures two speeds: how
+fast the model reads a 512-token prompt, and how fast it generates 128 tokens.
+
 ### Choosing the context size
 
 This rule was set before the benchmarks ran. The default context is the largest size
@@ -360,9 +373,15 @@ To redraw the charts from `bench/results/`, run `python3 docs/make_charts.py`.
 bench/tunnel_bench.py cloudflare=https://NAME.trycloudflare.com ssh=http://127.0.0.1:8001
 bench/stream_bench.py cloudflare=https://NAME.trycloudflare.com/v1 ssh=http://127.0.0.1:8765/v1
 
-# Speed and VRAM fit: run on the VM after the models download.
-scp -o ControlPath=$XDG_RUNTIME_DIR/colab-llm-llm.sock bench/gpu_bench.sh bench/kv_ab.sh x:/content/
-ssh -S $XDG_RUNTIME_DIR/colab-llm-llm.sock x 'mkdir -p /content/bench && setsid nohup bash /content/gpu_bench.sh > /content/bench/run.log 2>&1 &'
+# Speed and VRAM fit with llama-bench. Start the VM first (./colab-llm.py, then
+# ./colab-llm.py --model 14b, so that both models are on the VM). The scripts stop
+# llama-server, because llama-bench needs the whole GPU.
+SOCK=$XDG_RUNTIME_DIR/colab-llm-llm.sock
+scp -o ControlPath=$SOCK bench/gpu_bench.sh bench/kv_ab.sh x:/content/
+ssh -S $SOCK x 'mkdir -p /content/bench && setsid nohup bash -c "bash /content/gpu_bench.sh; bash /content/kv_ab.sh 9b,14b" > /content/bench/run.log 2>&1 &'
+ssh -S $SOCK x 'tail -f /content/bench/run.log'              # watch progress; Ctrl-C to stop watching
+scp -o ControlPath=$SOCK 'x:/content/bench/*.jsonl' bench/results/   # when the log says "done"
+./colab-llm.py                                               # start the server again
 
 # Long-context retrieval, through the running endpoint.
 bench/needle.py http://127.0.0.1:8765 --tokens 32000,128000 --depths 0.1,0.5,0.9
