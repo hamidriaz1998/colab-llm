@@ -177,13 +177,15 @@ def _llm_main():
             proc = subprocess.Popen(args, env=env, stdout=out, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, start_new_session=True)
         log(f"server: loading {os.path.basename(MODEL_PATH)} with ctx {CTX}")
-        for i in range(600):
-            if get(BASE + "/health"):
+        start, shown = time.time(), 0
+        while time.time() - start < 600:
+            if get(BASE + "/health", timeout=2):
                 break
             if proc.poll() is not None:
                 return result(error="server exited during load", log=open(LOGF, errors="ignore").read()[-1500:])
-            if i and i % 15 == 0:
-                log(f"server: still loading ({i}s)")
+            if time.time() - start >= shown + 15:
+                shown += 15
+                log(f"server: still loading ({shown}s)")
             time.sleep(1)
         else:
             return result(error="server never became healthy", log=open(LOGF, errors="ignore").read()[-1500:])
