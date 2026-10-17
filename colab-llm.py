@@ -196,7 +196,11 @@ def _llm_main():
 
     # ---- cloudflared tunnel ----
     url = None
-    if TUNNEL == "cloudflare":
+    if TUNNEL != "cloudflare":
+        # A tunnel left from an earlier --tunnel cloudflare run would now expose the server
+        # without its secret prefix.
+        subprocess.run("pkill -f '^/content/cloudflared tunnel'", shell=True)
+    else:
         cflog = "/content/cf.log"
         pat = r"https://[a-z0-9-]+\.trycloudflare\.com"
         m = re.search(pat, open(cflog, errors="ignore").read()) if os.path.exists(cflog) else None
