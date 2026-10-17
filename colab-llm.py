@@ -19,9 +19,9 @@ The default tunnel is `colab ssh` with a local port forward, so the endpoint is 
 http://127.0.0.1:PORT/v1: it never changes, and it is not public. The ssh master runs in the
 background after this script exits; `--stop` closes it.
 
-The script also writes/updates the `uncensored` provider so both agents can use the model:
-omp via ~/.omp/agent/models.yml (then `omp --model uncensored/abliterated`) and fx via
-~/.fx/settings.json (then `fx provider uncensored`). It writes them only when the URL changes.
+The script also writes/updates the `uncensored` provider so the omp and fx coding agents can
+use the model: omp via ~/.omp/agent/models.yml (then `omp --model uncensored/abliterated`) and
+fx via ~/.fx/settings.json (then `fx provider uncensored`). It writes them only on change.
 """
 
 from __future__ import annotations
@@ -228,7 +228,7 @@ def _llm_main():
                     break
             if not url:
                 return result(error="no tunnel URL", log=open(cflog, errors="ignore").read()[-800:])
-            # Wait until the edge serves it. Probing a fresh hostname from the laptop too early
+            # Wait until the edge serves it. Probing a fresh hostname from the client too early
             # makes the local resolver cache NXDOMAIN, which then hides the tunnel for ~90s.
             log("tunnel: waiting for the Cloudflare edge")
             for _ in range(60):
@@ -448,7 +448,7 @@ def register_fx(url: str, ctx: int) -> None:
     data.setdefault("providers", {})[PROVIDER_ID] = entry
     data.setdefault("models", {})[PROVIDER_ID] = MODEL_ALIAS
     # Deliberately NOT touching data["provider"]: that would hijack the active provider
-    # (currently the Codex subscription). Activate with `fx provider uncensored`.
+    # that the user already chose. Activate with `fx provider uncensored`.
     write_config(FX_SETTINGS, json.dumps(data, indent=2) + "\n")
     log(f"registered connection '{PROVIDER_ID}' in {FX_SETTINGS}")
 

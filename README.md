@@ -1,18 +1,29 @@
 # colab-llm
 
-`colab-llm.py` runs an uncensored llama.cpp model on a free Google Colab T4 GPU. It
-makes the model available on your computer as an OpenAI-compatible endpoint, and it
-registers that endpoint with the omp and fx coding agents.
+`colab-llm.py` runs an uncensored ("abliterated") Qwen model with
+[llama.cpp](https://github.com/ggml-org/llama.cpp) on a free Google Colab T4 GPU. It makes
+the model available on your computer as an OpenAI-compatible endpoint, so coding agents
+and other OpenAI clients can use it. It can also register the endpoint with the
+[omp](https://github.com/can1357/oh-my-pi) and [fx](https://github.com/vercel-labs/fx)
+coding agents.
 
-The default setup gives you a 262144-token (256K) context window, about 25 tokens per
-second with an empty context, and about 19 tokens per second at 98K tokens of context.
+The default setup gives you:
+
+- A 262144-token (256K) context window. The model finds facts anywhere in a 200K-token
+  prompt.
+- About 25 tokens per second with an empty context, and about 19 tokens per second at
+  98K tokens of context.
+- A private endpoint at `http://127.0.0.1:8765/v1` that does not change between runs.
+
+The script is one Python file with no dependencies outside the standard library.
+PyYAML is needed only for the omp registration.
 
 ## Requirements
 
 - The [`colab` CLI](https://pypi.org/project/google-colab-cli/), signed in to a Google
   account that can get a T4 GPU. To check the account, run `colab whoami`.
 - An SSH key at `~/.ssh/id_ed25519` or `~/.ssh/id_ecdsa`. `colab ssh` sends it to the VM.
-- Python 3.10 or later. To register the omp provider, you also need PyYAML.
+- Python 3.10 or later and OpenSSH. The script is tested on Linux.
 - Optional: `notify-send` and `wl-copy`. When the endpoint is ready, the script shows a
   desktop notification and copies the URL.
 
@@ -39,7 +50,7 @@ second with an empty context, and about 19 tokens per second at 98K tokens of co
    - Any OpenAI client: set `OPENAI_BASE_URL=http://127.0.0.1:8765/v1` and
      `OPENAI_API_KEY=none`.
 
-3. When you finish, stop the VM. An idle VM uses your Colab compute units.
+3. When you finish, stop the VM. A running VM uses your Colab GPU quota, even when idle.
 
    ```sh
    ./colab-llm.py --stop
@@ -72,6 +83,13 @@ To use more than one VM, give each one a name with `--session NAME`.
 
 Use `9b` for agents and coding. It is faster at every context size, and it is the only
 model that can hold more than 40K tokens. See [Benchmarks](#benchmarks).
+
+The models are community fine-tunes of Qwen models with refusals removed, published by
+[huihui-ai](https://huggingface.co/huihui-ai) and quantized to GGUF by
+[mradermacher](https://huggingface.co/mradermacher). Read their model cards for license
+terms and limitations. You are responsible for how you use them.
+
+To serve a different GGUF model, add an entry to `MODELS` in `colab-llm.py`.
 
 ## Thinking
 
@@ -126,8 +144,9 @@ Use `--tunnel cloudflare` when another computer must reach the model.
 
 ## Benchmarks
 
-All results are from one Colab T4 (15360 MiB) with llama.cpp build b11696, flash
-attention on, and all layers on the GPU. The raw data is in `bench/results/`.
+All results are from one Colab T4 (15360 MiB) in October 2026, with llama.cpp build
+b11696, flash attention on, and all layers on the GPU. Your results can be different:
+Colab VMs vary, and a T4 slows down when it gets hot. The raw data is in `bench/results/`.
 
 ### Choosing the context size
 
@@ -264,9 +283,7 @@ bench/needle.py http://127.0.0.1:8765 --tokens 32000,128000 --depths 0.1,0.5,0.9
 ## Troubleshooting
 
 **"Colab has no T4 for this account right now."** The account has reached its free GPU
-limit, or Colab has no free T4s. Try again later, or use another Google account. To
-switch accounts, move `~/.config/colab-cli/token.json` aside, then run `colab whoami`
-and sign in. `--watch` retries until it gets a GPU.
+limit, or Colab has no free T4s. Try again later. `--watch` retries until it gets a GPU.
 
 **The endpoint stops after a network outage.** The outage closes the SSH tunnel. Run
 `./colab-llm.py` again. It reconnects in about 4 seconds and keeps the same URL. With
@@ -280,8 +297,9 @@ ssh -S $XDG_RUNTIME_DIR/colab-llm-llm.sock x
 ```
 
 **Comments in `models.yml` are gone.** PyYAML does not keep comments. The script writes
-the file only when the URL or the context changes, and it keeps your first version in
-`models.yml.bak`. The same applies to `settings.json.bak`.
+the file only when the URL or the context changes, and the first time it changes a
+file, it keeps your version as `models.yml.bak` or `settings.json.bak`. To skip the
+agent configs completely, use `--no-register`.
 
 **The VM stops while you use it.** Colab stops a VM when its kernel is idle. Requests to
 the model do not count as kernel activity. Use `--watch`. It runs a small cell every 5
