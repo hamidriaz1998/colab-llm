@@ -304,3 +304,7 @@ agent configs completely, use `--no-register`.
 **The VM stops while you use it.** Colab stops a VM when its kernel is idle. Requests to
 the model do not count as kernel activity. Use `--watch`. It runs a small cell every 5
 minutes.
+
+## License
+
+[MIT](LICENSE). The models have their own licenses; see their model cards.
